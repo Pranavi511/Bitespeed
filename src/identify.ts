@@ -1,7 +1,6 @@
 import { dbAll, dbRun, Contact } from "./db";
 
 export async function processIdentityReconciliation(email?: string | null, phoneNumber?: string | number | null) {
-    // Normalize inputs
     const normalizedEmail = email ? email.toString().trim() : null;
     const normalizedPhone = phoneNumber ? phoneNumber.toString().trim() : null;
 
@@ -25,7 +24,6 @@ export async function processIdentityReconciliation(email?: string | null, phone
     const matchingContacts = await dbAll(query, params) as Contact[];
 
     if (matchingContacts.length === 0) {
-        // No matches mean entirely new primary contact
         const result = await dbRun(
             `INSERT INTO Contact (email, phoneNumber, linkPrecedence) VALUES (?, ?, 'primary')`,
             [normalizedEmail, normalizedPhone]
@@ -33,15 +31,13 @@ export async function processIdentityReconciliation(email?: string | null, phone
 
         return {
             contact: {
-                primaryContatctId: result.lastID, // Intentionally spelled with extra 't' as per requirements
-                emails: [normalizedEmail].filter(Boolean) as string[],
+                primaryContatctId: result.lastID,
                 phoneNumbers: [normalizedPhone].filter(Boolean) as string[],
                 secondaryContactIds: []
             }
         };
     }
 
-    // Matches found. Find the true primary contacts out of these
     const primaryIds = new Set<number>();
     for (const c of matchingContacts) {
         if (c.linkPrecedence === 'primary') {
@@ -49,45 +45,39 @@ export async function processIdentityReconciliation(email?: string | null, phone
         } else if (c.linkedId) {
             primaryIds.add(c.linkedId);
         } else {
-            primaryIds.add(c.id); // Fallback for data resilience
+            primaryIds.add(c.id); 
         }
     }
 
-    // Fetch true primary contacts to see if there's more than one
     const primaryContacts = await dbAll(
         `SELECT * FROM Contact WHERE id IN (${Array.from(primaryIds).join(',')})`
     ) as Contact[];
 
-    // Sort by earliest creation date to find the "oldest" primary
     primaryContacts.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
-    const oldestPrimary = primaryContacts[0];
+    const oldestPrimary = primaryContacts[0] as Contact;
+    if (!oldestPrimary) throw new Error("Data integrity error: primary contact not found.");
     const secondaryPrimaries = primaryContacts.slice(1);
 
-    // Convert newer primaries into secondaries of the oldest
     if (secondaryPrimaries.length > 0) {
         const idsToUpdate = secondaryPrimaries.map(p => p.id);
 
-        // Update the newer primaries directly
         await dbRun(
             `UPDATE Contact SET linkPrecedence = 'secondary', linkedId = ?, updatedAt = CURRENT_TIMESTAMP WHERE id IN (${idsToUpdate.join(',')})`,
             [oldestPrimary.id]
         );
 
-        // Update the secondary contacts that linked to those newer primaries
         await dbRun(
             `UPDATE Contact SET linkedId = ?, updatedAt = CURRENT_TIMESTAMP WHERE linkedId IN (${idsToUpdate.join(',')})`,
             [oldestPrimary.id]
         );
     }
 
-    // Fetch the definitive cluster of all linked contacts under oldestPrimary
     const fullCluster = await dbAll(
         `SELECT * FROM Contact WHERE id = ? OR linkedId = ? ORDER BY createdAt ASC`,
         [oldestPrimary.id, oldestPrimary.id]
     ) as Contact[];
 
-    // Determine if incoming payload has novel info
     const clusterEmails = fullCluster.map(c => c.email).filter(e => e !== null);
     const clusterPhones = fullCluster.map(c => c.phoneNumber).filter(p => p !== null);
 
@@ -95,7 +85,6 @@ export async function processIdentityReconciliation(email?: string | null, phone
     const isNewPhone = normalizedPhone && !clusterPhones.includes(normalizedPhone);
 
     if (isNewEmail || isNewPhone) {
-        // Create new secondary contact
         const result = await dbRun(
             `INSERT INTO Contact (email, phoneNumber, linkedId, linkPrecedence) VALUES (?, ?, ?, 'secondary')`,
             [normalizedEmail, normalizedPhone, oldestPrimary.id]
@@ -113,12 +102,10 @@ export async function processIdentityReconciliation(email?: string | null, phone
         });
     }
 
-    // Format array responses keeping primary first, ordered chronologically 
     const emailsSet = new Set<string>();
     const phonesSet = new Set<string>();
 
-    // ensure oldest (primary) contact values added first
-    const primaryContact = fullCluster.find(c => c.id === oldestPrimary.id) || oldestPrimary;
+    const primaryContact = (fullCluster.find(c => c.id === oldestPrimary.id) || oldestPrimary) as Contact;
 
     if (primaryContact.email) emailsSet.add(primaryContact.email);
     if (primaryContact.phoneNumber) phonesSet.add(primaryContact.phoneNumber);
@@ -129,7 +116,7 @@ export async function processIdentityReconciliation(email?: string | null, phone
     }
 
     const secondaryContactIds = fullCluster
-        .filter(c => c.id !== oldestPrimary.id) // all but primary are secondary
+        .filter(c => c.id !== oldestPrimary.id)
         .map(c => c.id);
 
     return {
